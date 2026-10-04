@@ -5,6 +5,8 @@
 //      blob: URL 再交 SW，blob URL 归页面进程，页面后台冻结后系统取不到图 → 回退默认。
 //      修复：dataURL 就地转 Blob 直传 NotificationOptions（icon/badge/image 规范支持
 //      (DOMString or Blob)），无头像时 icon 兜底 NOTIFY_ICON。
+//      （v3.18.x 已反转：Blob 对象实际会令 Chrome 通知失败——NotificationOptions 该三字段
+//      规范要求 USVString——改回 createObjectURL 生成 blob: URL 字符串，见 bg-keep.js 注释）
 //   ② 切后台→回来→再切出，系统通知弹出刚在聊天里看过的互动卡/消息——根因：recentChatDup
 //      精确相等比对，而互动卡通知文本=「前缀+卡面」，记录里只有裸卡面，永远对不上；
 //      且前台收到时什么都不记。修复：双向包含匹配 + 前台 markSeen 记忆（15min TTL）
@@ -35,12 +37,13 @@ function check(desc, ok, detail) {
   check('A1 media Blob 直传：prepMediaBlobs 统一转换 icon/badge/image + 逐级降级阶梯',
     /function prepMediaBlobs\(target, done\)/.test(s) &&
     /\[\[\], \['image'\], \['image', 'badge'\], \['image', 'badge', 'icon'\]\]/.test(s));
-  check('A2 不再有 blob: URL 中转（createObjectURL 仅存于注释）',
-    !/URL\.createObjectURL/.test(s.replace(/\/\/[^\n]*/g, '')));
+  check('A2 v3.18 反转口径：icon/badge/image 经 prepMediaBlobs 转 blob: URL 字符串（createObjectURL）',
+    /URL\.createObjectURL\(b\)/.test(s));
   check('A3 无头像兜底 icon=NOTIFY_ICON（杜绝大图标位空置回退浏览器默认）',
     /if \(!bigIcon\) bigIcon = NOTIFY_ICON;/.test(s));
-  check('A4 recentChatDup 双向包含匹配（较短边≥6字）+ 从末尾整条扫/时间戳自排除',
-    /mf\.length >= 6 && key\.length > mf\.length && key\.indexOf\(mf\) >= 0/.test(s) &&
+  check('A4 recentChatDup 双向包含匹配（较短边≥6字且≥1.6倍长度差）+ 从末尾整条扫/时间戳自排除',
+    /mf\.length >= 6 && key\.length > mf\.length && key\.length >= mf\.length \* 1\.6 && key\.indexOf\(mf\) >= 0/.test(s) &&
+    /key\.length >= 6 && mf\.length > key\.length && mf\.length >= key\.length \* 1\.6 && mf\.indexOf\(key\) >= 0/.test(s) &&
     /for \(let i = arr\.length - 1, n = 0/.test(s) &&
     /if \(refTs && \(mts >= refTs - 2500 \|\| \(!mts && i === arr\.length - 1\) \|\| Date\.now\(\) - mts < 2500\)\) continue;/.test(s));
   check('A5 前台已看记忆：visible 路径 markSeen + seenDup 第三道闸门',
@@ -91,7 +94,7 @@ function ext(p) { const i = p.lastIndexOf('.'); return i < 0 ? '' : p.slice(i); 
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const baseUrl = 'http://127.0.0.1:' + server.address().port;
 
-const cdpPort = 9900 + Math.floor(Math.random() * 100);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9900 + Math.floor(Math.random() * 100));
 const chrome = spawn(chromePath, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--autoplay-policy=no-user-gesture-required',
@@ -176,11 +179,12 @@ gi = await evalJs(`
 `);
 check('B1 新卡到达不被自己的入库条目拦（refTs 自排除，dupInChat=false）', !!gi && gi.dupInChat === false, gi);
 
-// 把这对条目回拨到 5 分钟前 = 用户 5 分钟前已在聊天里看过这张卡
+// 把这对条目回拨到 3 分钟前 = 用户 3 分钟前已在聊天里看过这张卡
+// （v3.20.x 查重窗口 15→5 分钟：回拨 5 分钟正好压线在窗外，必须落在窗口内）
 await evalJs(`
   (function () {
     const arr = window.getChatMsgs();
-    for (let i = Math.max(0, arr.length - 2); i < arr.length; i++) arr[i].ts = Date.now() - 5 * 60000;
+    for (let i = Math.max(0, arr.length - 2); i < arr.length; i++) arr[i].ts = Date.now() - 3 * 60000;
   })(); 'ok'
 `);
 gi = await evalJs(`window.bgNotifyGateInfo('TA想问你一个问题：今晚吃什么呀')`);
@@ -213,6 +217,14 @@ await evalJs(`
 check('B6 前台展示即记 seen 指纹（dupSeen=true）', (await evalJs(`window.bgNotifyGateInfo('前台看过的内容Q').dupSeen`)) === true);
 
 // B7 全链路：隐藏 >15s 后对已看内容调 bgNotifyCheck，统计上只进 dup 不进 sent
+// 确定性处理：保活定时器在静置期间会真实发送并刷新闭包内 lastNotifySentAt（v3.22.x
+// 批量连发 30s 窗口随之旁路 seenDup 闸，且无法从外部清零）——先把 Notification.permission
+// 临时置 denied（发送在闸门前即 return：不刷新 lastNotifySentAt 也不进统计），静置 31s
+// 让既有 30s 连发窗口老化，再恢复 granted 跑 B7。
+console.log('  … 静默保活 31s（Notification.permission=denied 越过 30s 连发窗口）');
+await evalJs(`(function(){ try { Object.defineProperty(Notification, 'permission', { configurable: true, get: function () { return 'denied'; } }); } catch (e) { return String(e); } return 'ok'; })()`);
+await sleep(31000);
+await evalJs(`(function(){ try { Object.defineProperty(Notification, 'permission', { configurable: true, get: function () { return 'granted'; } }); } catch (e) { return String(e); } return 'ok'; })()`);
 const before = await evalJs(`window.bgNotifyGateStats()`);
 await evalJs(`window.bgNotifyCheck('前台看过的内容Q', Date.now(), {}); 'ok'`);
 const after = await evalJs(`window.bgNotifyGateStats()`);

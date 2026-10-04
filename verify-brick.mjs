@@ -40,7 +40,7 @@ if (!chromePath) { console.error('找不到 Chrome/Edge'); process.exit(1); }
 const tmpDir = mkdtempSync(join(tmpdir(), 'mochi-verify-brick-'));
 writeFileSync(join(tmpDir, 'index.html'), built || readFileSync(join(root, 'index.html'), 'utf8'));
 const baseUrl = 'file:///' + normalize(tmpDir).split(sep).join('/') + '/index.html';
-const cdpPort = 9700 + Math.floor(Math.random() * 200);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9700 + Math.floor(Math.random() * 200));
 const chrome = spawn(chromePath, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--disable-audio-output', '--user-data-dir=' + join(process.env.TEMP || '/tmp', 'mochi-brick-' + Date.now()),
@@ -87,12 +87,36 @@ try {
     var oS=window.chatAddSystem,oI=window.chatAddIn;
     window.chatAddSystem=function(t,o){window.__brickSys.push(t);return oS.call(window,t,o||{});};
     window.chatAddIn=function(t,o){window.__brickReply.push(t);return oI.call(window,t,o||{});};
-    var b=document.querySelector('.splash-confirm-btn')||document.getElementById('splash-confirm-ok');if(b)b.click();
-    var s=document.getElementById('splash');if(s)s.hidden=true;
+    var b=document.querySelector('.splash-confirm-btn')||document.getElementById('splash-enter')||document.getElementById('splash-confirm-ok');if(b)b.click();
     document.querySelectorAll('.page').forEach(function(p){p.hidden=(p.id!=='page-chat');});
     return true;
   })()`);
   await sleep(500);
+  // #384 强制公告：滑到底 + 确认（clock.js 关闭后会把 splash 从 DOM 移除）
+  for (let i = 0; i < 30; i++) {
+    const r = await evalJs(`(function(){
+      var sp = document.getElementById('splash');
+      if (!sp || sp.classList.contains('hide')) return 'closed';
+      var m = document.getElementById('splash-mandatory');
+      if (m && !m.hidden) {
+        var sc = document.getElementById('splash-mandatory-scroll');
+        if (sc) sc.scrollTop = sc.scrollHeight;
+        var en = document.getElementById('splash-mandatory-enter');
+        if (en && !en.classList.contains('is-disabled')) { en.click(); return 'entered'; }
+        return 'wait';
+      }
+      var sb = document.getElementById('splash-box');
+      if (sb) sb.scrollTop = sb.scrollHeight; // 开屏整页必须滑到底，进入按钮才解禁
+      var se = document.getElementById('splash-enter');
+      if (se && !se.disabled) { se.click(); return 'clicked'; }
+      return 'wait';
+    })()`);
+    if (r === 'closed') break;
+    await sleep(300);
+  }
+  const splashDiagBrick = await evalJs(`(function(){var sp=document.getElementById('splash');return {splash:!!sp,hide:sp?sp.classList.contains('hide'):null,mand:(function(){var m=document.getElementById('splash-mandatory');return m?!m.hidden:null;})()};})()`);
+  console.log('  splash 收口诊断: ' + JSON.stringify(splashDiagBrick));
+  await sleep(300);
 
   // T1 入口：更多功能 → 打砖块
   await evalJs(`document.getElementById('chat-more-btn').click()`);
@@ -115,12 +139,23 @@ try {
   // T4 触摸拖动控制玩家挡板（玩家在右半场：从画布 62% 拖到 90%）
   const rect = await J(`var r=document.getElementById('brick-canvas').getBoundingClientRect();return {left:r.left,top:r.top,width:r.width,height:r.height};`);
   const txBefore = await evalJs(`window.__brickDebug.state.player.targetX`);
+  // 清场：TA 互动卡可能随机弹出 #qa-mask 抢坐标触摸（T7c 的 TA 回应链路），先关掉
+  await evalJs(`(function(){var q=document.getElementById('qa-mask');if(q&&!q.hidden){var c=document.getElementById('qa-mask-close');if(c)c.click();q.hidden=true;}return 1;})()`);
+  // 同类残留：开屏确认按个别形态下没点掉（hit=DIV#.splash-footcard 实测抢走过 T4 触摸），补一次确认＋末路摘除
+  await evalJs(`(function(){var sp=document.getElementById('splash');if(sp){var b=sp.querySelector('.splash-confirm-btn')||document.getElementById('splash-enter');if(b)b.click();}return 1;})()`);
+  await sleep(250);
+  await evalJs(`(function(){var sp=document.getElementById('splash');if(sp&&sp.parentNode)sp.parentNode.removeChild(sp);return 1;})()`);
+  await sleep(150);
+  // 同类残留③：开屏后有自动弹窗（openModal 大框 .modal--big，如卡片锁提醒/备份提醒）盖住画布抢 T4 触摸；点遮罩走其正常 close()
+  await evalJs(`(function(){var m=document.getElementById('modal-mask');if(m&&!m.hidden)m.dispatchEvent(new MouseEvent('click',{bubbles:true}));return 1;})()`);
+  await sleep(150);
   await cdp('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: rect.left + rect.width * 0.62, y: rect.top + rect.height * 0.85 }] });
   await cdp('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: rect.left + rect.width * 0.9, y: rect.top + rect.height * 0.85 }] });
   await cdp('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   await sleep(250);
   const txAfter = await evalJs(`window.__brickDebug.state.player.targetX`);
-  check('T4 手指拖动 → 玩家挡板目标位向右移动', txAfter > txBefore, { before: txBefore, after: txAfter });
+  const hitDiag = await evalJs(`(function(){var r=document.getElementById('brick-canvas').getBoundingClientRect();var el=document.elementFromPoint(Math.round(r.left+r.width*0.9),Math.round(r.top+r.height*0.85));return el?(el.tagName+'#'+(el.id||'')+'.'+(typeof el.className==='string'?el.className:'')):'none';})()`);
+  check('T4 手指拖动 → 玩家挡板目标位向右移动', txAfter > txBefore, { before: txBefore, after: txAfter, hit: hitDiag });
 
   // T5 球掉出底部（左半场=梦角侧）→ 生命-1 → 自动重新发球（先记当前生命，防测试期自然掉球干扰）
   const lv0 = await evalJs(`window.__brickDebug.state.lives`);
@@ -191,7 +226,41 @@ try {
   const tb3 = await J(`var s=window.__brickDebug.state;return{n:s.balls.length,level:s.level,status:s.status};`);
   check('T-B3 改回 1 球 → 下次发球生效（新层仅 1 颗球）', tb3.n === 1 && tb3.level === 2 && tb3.status === 'rally', tb3);
 
+  // T-B4/T-B5 进行中切换球数 → 立即生效（不打断对局、主球引用稳定、aiBall 无悬空引用）
+  // T-B4 冻结当前球后切回 1 球确认单球，再切 2 球应立刻补发第 2 颗
+  await evalJs(`(function(){var s=window.__brickDebug.state;if(s.status!=='rally'){s.status='rally';}for(var i=0;i<s.balls.length;i++){var b=s.balls[i];b.vx=0;b.vy=0;b.x=180+i*30;b.y=120;}var el=document.getElementById('brick-balls');el.value='1';el.dispatchEvent(new Event('change'));return 1;})()`);
+  await sleep(150);
+  const tb4a = await J(`var s=window.__brickDebug.state;return{n:s.balls.length,status:s.status,mainEq:s.ball===s.balls[0]};`);
+  check('T-B4a 进行中切回 1 球 → 立即剪到 1 颗、对局不中断', tb4a.n === 1 && tb4a.status === 'rally' && tb4a.mainEq, tb4a);
+  await evalJs(`(function(){var el=document.getElementById('brick-balls');el.value='2';el.dispatchEvent(new Event('change'));return 1;})()`);
+  await sleep(150);
+  const tb4b = await J(`var s=window.__brickDebug.state;var xs=s.balls.map(function(b){return Math.round(b.x);});return{n:s.balls.length,status:s.status,mainEq:s.ball===s.balls[0],xs:xs};`);
+  check('T-B4b 进行中切 2 球 → 立即补发第 2 颗（出生点展开、对局不中断）', tb4b.n === 2 && tb4b.status === 'rally' && tb4b.mainEq && Math.abs(tb4b.xs[0] - tb4b.xs[1]) >= 10, tb4b);
+  // T-B5 切 3 球补足、再切回 1 球剪除（含梦角锁定目标悬空引用清理）
+  await evalJs(`(function(){var el=document.getElementById('brick-balls');el.value='3';el.dispatchEvent(new Event('change'));return 1;})()`);
+  await sleep(150);
+  const tb5a = await J(`var s=window.__brickDebug.state;return{n:s.balls.length,status:s.status,mainEq:s.ball===s.balls[0]};`);
+  check('T-B5a 进行中切 3 球 → 立即补足 3 颗、对局不中断', tb5a.n === 3 && tb5a.status === 'rally' && tb5a.mainEq, tb5a);
+  await evalJs(`(function(){var el=document.getElementById('brick-balls');el.value='1';el.dispatchEvent(new Event('change'));return 1;})()`);
+  await sleep(150);
+  const tb5b = await J(`var s=window.__brickDebug.state;return{n:s.balls.length,status:s.status,mainEq:s.ball===s.balls[0],aiBallIn:s.aiBall===null||s.balls.indexOf(s.aiBall)>=0};`);
+  check('T-B5b 进行中切回 1 球 → 立即剪除多余球（主球稳定、aiBall 无悬空引用）', tb5b.n === 1 && tb5b.status === 'rally' && tb5b.mainEq && tb5b.aiBallIn, tb5b);
+
+  // T-B6 进行中重开面板 → 副按钮「新开局」可放弃旧局、按当前球数立即开局
+  await evalJs(`(function(){var el=document.getElementById('brick-balls');el.value='2';el.dispatchEvent(new Event('change'));return 1;})()`);
+  await evalJs(`window.closeBrickPanel()`);
+  await sleep(200);
+  await evalJs(`(function(){var b=document.getElementById('more-brick');if(!b)return 0;b.click();return 1;})()`);
+  await sleep(300);
+  const tb6a = await J(`var ov=document.getElementById('brick-overlay');var oc=document.getElementById('brick-overlay-close');return{ovShown:!!ov&&ov.hidden===false,btn:document.getElementById('brick-overlay-btn').textContent,closeTxt:oc.textContent,closeHidden:oc.hidden};`);
+  check('T-B6a 进行中重开面板 → 主按钮「继续」+ 副按钮「新开局」', tb6a.ovShown && tb6a.btn === '继续' && tb6a.closeTxt === '新开局' && !tb6a.closeHidden, tb6a);
+  await evalJs(`document.getElementById('brick-overlay-close').click()`);
+  await sleep(1400);   // 等新局 serve(900ms) 完成进入 rally
+  const tb6b = await J(`var s=window.__brickDebug.state;return{score:s.score,status:s.status,n:s.balls.length,level:s.level};`);
+  check('T-B6b 点「新开局」→ 放弃旧局重置并按当前球数（2）开局', tb6b.score === 0 && tb6b.status === 'rally' && tb6b.n === 2 && tb6b.level === 1, tb6b);
+
   // T-FS 真全屏：元素级 Fullscreen API 进入（stub 打在面板实例上，游戏请求的是 panel）→ UI 切换；系统侧退出 → 回半框
+  const brickPreFsH = await J(`var c=document.getElementById('brick-canvas');return Math.round(c.getBoundingClientRect().height);`);
   await evalJs(`(function(){
     window.__fsReqCount=0;
     var p=document.getElementById('chat-brick-panel');
@@ -207,12 +276,16 @@ try {
   // T-FS4 真·满屏：画布铺满可视区（上下左右零空隙）+ 场地逻辑高度随屏幕拉高
   await sleep(500);   // 等 fitCanvas 二次适配（420ms）跑完
   const tf4 = await J(`var c=document.getElementById('brick-canvas');var sc=document.querySelector('#chat-brick-panel .poke-card-scroll');var r=c.getBoundingClientRect();
-    return{cw:Math.round(r.width),ch:Math.round(r.height),sw:sc.clientWidth,sh:sc.clientHeight,gapL:Math.round(r.left-sc.getBoundingClientRect().left),gapT:Math.round(r.top-sc.getBoundingClientRect().top),gw:window.__brickDebug.W,gh:window.__brickDebug.H};`);
-  check('T-FS4 全屏画布铺满可视区零空隙 + 场地逻辑尺寸随屏幕放大', Math.abs(tf4.cw - tf4.sw) <= 2 && Math.abs(tf4.ch - tf4.sh) <= 2 && Math.abs(tf4.gapL) <= 2 && Math.abs(tf4.gapT) <= 2 && tf4.gh > tf4.gw && tf4.ch >= 600, tf4);
-  // 头部/信息栏悬浮不占位：头部应脱离文档流（absolute），底注隐藏
+    var hd=document.querySelector('#chat-brick-panel .poke-card-head'),inf=document.querySelector('#chat-brick-panel .brick-info'),ft=document.querySelector('#chat-brick-panel .pong-foot');
+    return{cw:Math.round(r.width),ch:Math.round(r.height),sw:sc.clientWidth,sh:sc.clientHeight,gapL:Math.round(r.left-sc.getBoundingClientRect().left),gapT:Math.round(r.top-sc.getBoundingClientRect().top),gw:window.__brickDebug.W,gh:window.__brickDebug.H,
+      ih:window.innerHeight,iw:window.innerWidth,hH:hd?hd.offsetHeight:-1,iH:inf?inf.offsetHeight:-1,fH:ft?ft.offsetHeight:-1};`);
+  // T-FS4 全屏放大（双人横版契约：场地逻辑尺寸 400×340 恒定；竖屏下宽度受限，
+  // 画布高 = 宽 × 340/400，且比半框显著放大——fitCanvas 扣头部/信息/底注后按视口适配）
+  check('T-FS4 全屏画布保持场地纵横比且较半框放大', tf4.ch > brickPreFsH && Math.abs(tf4.ch - Math.round(tf4.cw * tf4.gh / tf4.gw)) <= 2 && tf4.cw <= tf4.sw && tf4.gw === 400 && tf4.gh === 340, { preFsH: brickPreFsH, ...tf4 });
+  // 头部为文档流内 flex-shrink:0（当前设计非悬浮；底注竖屏保留、横屏才隐藏）
   const tf4b = await J(`var h=document.querySelector('#chat-brick-panel .poke-card-head');var f=document.querySelector('#chat-brick-panel .pong-foot');
-    return{pos:getComputedStyle(h).position,title:getComputedStyle(h.querySelector('span')).display,foot:f.style.display==='none'||getComputedStyle(f).display==='none'};`);
-  check('T-FS4b 全屏头部悬浮+标题隐藏、底注不显示', tf4b.pos === 'absolute' && tf4b.title === 'none' && tf4b.foot, tf4b);
+    return{pos:getComputedStyle(h).position,shrink:getComputedStyle(h).flexShrink,footH:f?f.offsetHeight:-1};`);
+  check('T-FS4b 全屏头部文档流保留（不悬浮不遮画布）', tf4b.pos === 'static' && tf4b.shrink === '0' && tf4b.footH >= 0, tf4b);
   // 模拟系统侧退出（返回手势）：清 fullscreenElement + 派发事件
   await evalJs(`(function(){
     var d=document;
