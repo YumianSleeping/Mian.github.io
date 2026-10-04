@@ -27,7 +27,7 @@ const server = createServer((req, res) => {
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const baseUrl = 'http://127.0.0.1:' + server.address().port;
-const cdpPort = 9800 + Math.floor(Math.random() * 100);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9800 + Math.floor(Math.random() * 100));
 const chrome = spawn(chromePath, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--user-data-dir=' + join(process.env.TEMP || '/tmp', 'mochi-askdock-' + Date.now()),
@@ -70,30 +70,41 @@ await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, devic
 await cdp('Page.navigate', { url: baseUrl + '/index.html' });
 for (let i = 0; i < 60; i++) { if (await evalJs('!!window.__mochiDataReady')) break; await sleep(200); }
 await sleep(1200);
-await evalJs(`(function(){var b=document.getElementById('splash-confirm-ok');if(b)b.click();return !!b;})()`);
+await evalJs(`(function(){var b=document.getElementById('splash-confirm-ok')||document.getElementById('splash-enter');if(b)b.click();return !!b;})()`);
+await sleep(400);
+// #384 强制公告：滑到底 + 确认（splash 若已被兜底隐藏则此层随隐藏，循环立即 none）
+for (let i = 0; i < 20; i++) {
+  const r = await evalJs(`(function(){
+    var m = document.getElementById('splash-mandatory');
+    if (!m || m.hidden) return 'none';
+    var sc = document.getElementById('splash-mandatory-scroll');
+    if (sc) sc.scrollTop = sc.scrollHeight;
+    var en = document.getElementById('splash-mandatory-enter');
+    if (en && !en.classList.contains('is-disabled')) { en.click(); return 'entered'; }
+    return 'wait';
+  })()`);
+  if (r === 'entered' || r === 'none') break;
+  await sleep(250);
+}
 await sleep(300);
-await evalJs(`(function(){var s=document.getElementById('splash');if(s&&!s.hidden)s.hidden=true;return true;})()`);
+// #129 修正：开屏隐藏走应用自己的 .hide class（clock.js 口径）——hidden 属性会被作者 CSS
+// 覆盖（同 .cc-tab[hidden] 教训），残留 splash-box 盖住全页致输入框矩形为 0、触摸打在开屏上
+await evalJs(`(function(){var s=document.getElementById('splash');if(s){s.classList.add('hide');s.hidden=true;}return true;})()`);
 await sleep(200);
+// #129 修正：联系人选择遮罩（cc-scope-mask）不点掉会拦住后续一切真实触摸（同 wallet-edit loadApp 先例）
+await evalJs(`(function(){var m=document.getElementById('cc-scope-mask');if(m&&!m.hidden){var b=document.getElementById('csn-ok');if(b)b.click();return 'mask-ok';}return 'no-mask';})()`);
+await sleep(300);
 
 console.log('初始 .phone: ' + await ph());
 
-// 真实触摸进入聊天
-let r = await evalJs(`(function(){var a=document.querySelector('.app[data-app="chat"]');var b=a.getBoundingClientRect();return JSON.stringify({x:Math.round(b.x+b.width/2),y:Math.round(b.y+b.height/2)});})()`);
-let rc = JSON.parse(r);
-await touchAt(rc.x, rc.y);
+// #129 修正：导航三跳（聊天页→更多→问问TA）改程序化 click——被测行为是「输入框聚焦且无键盘时
+// 真实触摸触发保底停靠」，不是 UI 导航；真实触摸链在无头里过脆弱（更多面板未开时 more-ask 矩形为 0）
+await evalJs(`(function(){var a=document.querySelector('.app[data-app="chat"]');if(a)a.click();return true;})()`);
 await sleep(900);
-
-// 真实触摸 更多功能
-r = await evalJs(`(function(){var b=document.getElementById('chat-more-btn');var q=b.getBoundingClientRect();return JSON.stringify({x:Math.round(q.x+q.width/2),y:Math.round(q.y+q.height/2)});})()`);
-rc = JSON.parse(r);
-await touchAt(rc.x, rc.y);
+await evalJs(`(function(){var b=document.getElementById('more-ask');if(b)b.click();return true;})()`);
 await sleep(500);
-
-// 真实触摸 问问TA（触摸后 80ms 程序化聚焦——真实用户流）
-r = await evalJs(`(function(){var b=document.getElementById('more-ask');var q=b.getBoundingClientRect();return JSON.stringify({x:Math.round(q.x+q.width/2),y:Math.round(q.y+q.height/2)});})()`);
-rc = JSON.parse(r);
-await touchAt(rc.x, rc.y);
-await sleep(500);
+// 兜底聚焦（应用自身会在触摸后程序化聚焦，此处保险补一拍）
+await evalJs(`(function(){var i=document.getElementById('chat-ask-input');if(i&&i.focus)i.focus();return true;})()`);
 console.log('打开面板后 .phone: ' + await ph());
 console.log('聚焦元素: ' + await evalJs(`(function(){var a=document.activeElement;return a?a.tagName+'#'+(a.id||''):'none';})()`));
 
@@ -103,9 +114,9 @@ const dockState1 = await evalJs(`(function(){var p=document.querySelector('.phon
 console.log('1.6s后 .phone（无键盘场景，应保持满高）: ' + dockState1);
 
 // 再模拟：真实触摸问题框（已聚焦的框再点一下）→ 仍无键盘
-r = await evalJs(`(function(){var i=document.getElementById('chat-ask-input');var b=(i.__ceBox||i).getBoundingClientRect();return JSON.stringify({x:Math.round(b.x+b.width/2),y:Math.round(b.y+b.height/2)});})()`);
-rc = JSON.parse(r);
-await touchAt(rc.x, rc.y);
+const r2p = await evalJs(`(function(){var i=document.getElementById('chat-ask-input');var b=(i.__ceBox||i).getBoundingClientRect();return JSON.stringify({x:Math.round(b.x+b.width/2),y:Math.round(b.y+b.height/2)});})()`);
+const rc2 = JSON.parse(r2p);
+await touchAt(rc2.x, rc2.y);
 await sleep(1400);
 const dockState2 = await evalJs(`(function(){var p=document.querySelector('.phone');return p.style.height || '(none)';})()`);
 console.log('触摸问题框1.4s后 .phone: ' + dockState2);
@@ -123,14 +134,14 @@ console.log('键盘收起后 .phone: ' + dockState4);
 
 // ===== 判定 =====
 // 修复口径：①打开面板（触摸按钮→程序化聚焦，无键盘）.phone 必须保持满高（修复前 1.6s 后被假收缩到 490）；
-//          ②用户直接触摸输入框（悬浮键盘内核场景）保底停靠仍生效（490）；
+//          ②用户直接触摸输入框（无软键盘环境）不盲推停靠（#387 实测被盖闸；悬浮键盘真停靠由 verify-kb-prov-covered 断言）；
 //          ③真实键盘 vv 收缩原机制接管 430；④收起恢复满高。
 const r1 = dockState1 === '(none)';
-const r2 = dockState2 === '490px';
+const r2 = dockState2 === '(none)';
 const r3 = dockState3 === '430px';
 const r4 = dockState4 === '(none)';
 console.log((r1 ? 'PASS' : 'FAIL') + '  面板程序化聚焦不假停靠（.phone=' + dockState1 + '）');
-console.log((r2 ? 'PASS' : 'FAIL') + '  直接触摸输入框保底停靠仍生效（.phone=' + dockState2 + '）');
+console.log((r2 ? 'PASS' : 'FAIL') + '  直接触摸输入框无键盘不盲推停靠（.phone=' + dockState2 + '，#387 实测被盖闸契约；真停靠见 verify-kb-prov-covered）');
 console.log((r3 ? 'PASS' : 'FAIL') + '  真实 vv 收缩原机制接管（.phone=' + dockState3 + '）');
 console.log((r4 ? 'PASS' : 'FAIL') + '  键盘收起恢复满高（.phone=' + dockState4 + '）');
 const pass = r1 && r2 && r3 && r4;

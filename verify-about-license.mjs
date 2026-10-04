@@ -48,7 +48,7 @@ const baseUrl = 'http://127.0.0.1:' + server.address().port;
 const candidates = [process.env.CHROME_PATH, 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'].filter(Boolean);
 const chromePath = candidates.find((p) => { try { return statSync(p).isFile(); } catch (e) { return false; } });
 if (!chromePath) { console.error('找不到 Chrome/Edge'); process.exit(1); }
-const cdpPort = 9950 + Math.floor(Math.random() * 49);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9950 + Math.floor(Math.random() * 49));
 const chrome = spawn(chromePath, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + join(tmpdir(), 'mochi-ab-' + Date.now()), '--remote-debugging-port=' + cdpPort, 'about:blank'], { stdio: 'ignore' });
 
 let ws = null, msgId = 0;
@@ -98,7 +98,7 @@ await sleep(400);
 
 // T1 设置页只有合并入口
 let r1 = J(await evalJs("(function(){var ra=document.getElementById('row-about');var rl=document.getElementById('row-license');var txt=ra?ra.querySelector('.txt').textContent:'';return JSON.stringify({hasAbout:!!ra,label:txt,noLicense:!rl});})()"));
-check('T1 合并入口存在、旧许可入口已删', r1.hasAbout && r1.noLicense && r1.label === '功能介绍与二传二改说明', r1.label);
+check('T1 合并入口存在、旧许可入口已删', r1.hasAbout && r1.noLicense && r1.label.indexOf('功能介绍') >= 0 && r1.label.indexOf('许可') >= 0, r1.label);
 
 // T2 点击进入合并页：hero / 原版徽章 / 版本号已替换
 await evalJs("(function(){var b=document.getElementById('row-about');if(b)b.click();return true;})()");
@@ -113,13 +113,13 @@ await sleep(200);
 let r3b = J(await evalJs("(function(){var d=document.querySelectorAll('#page-about details.lic-grp');return JSON.stringify({secondOpenNow:d[1]?d[1].open:false});})()"));
 check('T3 分组折叠交互正常（默认开第一个，点击可展开第二个）', r3a.firstOpen && !r3a.secondOpen && r3b.secondOpenNow, JSON.stringify(r3a) + '→' + JSON.stringify(r3b));
 
-// T4 原版定位文案：新表述在、旧「基于星言修改」表述已清
-let r4 = J(await evalJs("(function(){var h=document.getElementById('page-about');var t=h?h.innerHTML:'';return JSON.stringify({original:t.indexOf('原创独立作品（即原版）')>=0,noOldBase:t.indexOf('基于')<0||t.indexOf('星言字卡』修改')<0&&t.indexOf('星言字卡】修改')<0,licenseHead:t.indexOf('关于星言字卡与灵感来源')>=0,felix:t.indexOf('9416318007')>=0,multi:t.indexOf('多人决定功能：借鉴自')>=0});})()"));
-check('T4 许可区合并完成：原创定位+第三方署名齐全', r4.original && r4.noOldBase && r4.licenseHead && r4.felix && r4.multi, JSON.stringify(r4));
+// T4 原版定位文案：新表述在、旧「基于星言修改」表述已清；「关于星言字卡与灵感来源」卡已整卡删除
+let r4 = J(await evalJs("(function(){var h=document.getElementById('page-about');var t=h?h.innerHTML:'';return JSON.stringify({original:t.indexOf('原创独立作品（即原版）')>=0,noOldBase:t.indexOf('基于')<0||t.indexOf('星言字卡』修改')<0&&t.indexOf('星言字卡】修改')<0,starCardGone:t.indexOf('关于星言字卡与灵感来源')<0&&t.indexOf('禁止二传二改')<0});})()"));
+check('T4 许可区：原创定位齐全、星言卡已删', r4.original && r4.noOldBase && r4.starCardGone, JSON.stringify(r4));
 
-// T5 许可（LICENSE）与灵感来源（README.md）卡置于顶部、位于功能清单之前；旧「许可与署名/README 配文」已移除
-let r5 = J(await evalJs("(function(){var pg=document.getElementById('page-about');var cards=Array.prototype.slice.call(pg.querySelectorAll('.cal-card'));var li=-1,ab=-1,fe=-1;for(var i=0;i<cards.length;i++){var h=cards[i].querySelector('.lic-h');var ht=h?(h.textContent||''):'';if(li<0&&ht.indexOf('许可')>=0)li=i;if(ab<0&&ht.indexOf('关于星言字卡与灵感来源')>=0)ab=i;if(fe<0&&cards[i].querySelector('.lic-grp'))fe=i;}var html=pg.innerHTML;return JSON.stringify({li:li,ab:ab,fe:fe,top:li>0&&ab===li+1&&fe===ab+1,mustSource:html.indexOf('必须标注灵感来源')>=0,noOld:html.indexOf('README 配文')<0&&html.indexOf('许可与署名')<0});})()"));
-check('T5 许可/灵感来源卡置顶且先于功能清单，旧块已删', r5.top && r5.mustSource && r5.noOld, JSON.stringify(r5));
+// T5 许可（LICENSE）卡置于顶部、位于功能清单之前；「关于星言字卡与灵感来源」卡已整卡删除，旧「许可与署名/README 配文」已移除
+let r5 = J(await evalJs("(function(){var pg=document.getElementById('page-about');var cards=Array.prototype.slice.call(pg.querySelectorAll('.cal-card'));var li=-1,ab=-1,fe=-1;for(var i=0;i<cards.length;i++){var h=cards[i].querySelector('.lic-h');var ht=h?(h.textContent||''):'';if(li<0&&ht.indexOf('许可')>=0)li=i;if(ab<0&&ht.indexOf('关于星言字卡与灵感来源')>=0)ab=i;if(fe<0&&cards[i].querySelector('.lic-grp'))fe=i;}var html=pg.innerHTML;return JSON.stringify({li:li,ab:ab,fe:fe,top:li>=1&&ab<0&&fe>li,noOld:html.indexOf('README 配文')<0&&html.indexOf('许可与署名')<0});})()"));
+check('T5 许可卡置顶且先于功能清单，星言卡与旧块已删', r5.top && r5.noOld, JSON.stringify(r5));
 
 // T6 返回按钮回设置页；旧 license 页不存在
 await evalJs("(function(){var b=document.getElementById('about-back');if(b)b.click();return true;})()");
