@@ -48,7 +48,7 @@ const server = createServer((req, res) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const baseUrl = 'http://127.0.0.1:' + server.address().port;
 
-const cdpPort = 9950 + Math.floor(Math.random() * 100);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9950 + Math.floor(Math.random() * 100));
 const chrome = spawn(chromePath, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--user-data-dir=' + join(process.env.TEMP || '/tmp', 'mochi-vip-' + Date.now()),
@@ -112,10 +112,10 @@ const INIT_SCRIPT = `
   window.fetch = function (input, opts) {
     var url = typeof input === 'string' ? input : (input && input.url) || '';
     window.__fetched.push(String(url).slice(0, 140));
-    if (url.indexOf('/meting/?type=playlist') >= 0) {
+    if (url.indexOf('meting') >= 0 && url.indexOf('type=playlist') >= 0) {
       return Promise.resolve(new Response(${JSON.stringify(METING_JSON)}, { status: 200, headers: { 'Content-Type': 'application/json' } }));
     }
-    if (url.indexOf('music.163.com/api/v6/playlist/detail') >= 0) {
+    if (url.indexOf('music.163.com/api/v6/playlist/detail') >= 0 || url.indexOf('music.163.com%2Fapi%2Fv6%2Fplaylist%2Fdetail') >= 0) {
       return Promise.resolve(new Response(${JSON.stringify(V6_JSON)}, { status: 200, headers: { 'Content-Type': 'application/json' } }));
     }
     return origFetch ? origFetch(input, opts) : Promise.reject(new Error('no-fetch'));
@@ -133,12 +133,18 @@ window.Audio = function () {
     buffered: { length: 0, end: function () { return 0; } },
     style: {}, parentNode: { removeChild: function () {} },
     onplay: null, onpause: null, onended: null, onerror: null, onloadedmetadata: null,
-    removeAttribute: function () {}, load: function () {}
+    removeAttribute: function () {}, load: function () {},
+    addEventListener: function () {}
   };
   el.play = function () {
     if (window.__au.rejectMode) {
       window.__au.log.push({ act: 'reject', inst: idx, t: Date.now() });
-      return Promise.reject(new Error('NotAllowedError'));
+      // v3.26.x：模拟真实浏览器的自动播放拦截——错误对象挂 name='NotAllowedError'
+      //（真实内核是 DOMException.name；旧 mock 只把名字放 message，播放器按 err.name
+      // 区分错误类型后会误判成源加载失败走换源兜底，测试场景失真）
+      var re = new Error('The play method is not allowed by the user agent');
+      re.name = 'NotAllowedError';
+      return Promise.reject(re);
     }
     el.paused = false;
     window.__au.log.push({ act: 'play', inst: idx, t: Date.now() });

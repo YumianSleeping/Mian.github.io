@@ -1,4 +1,5 @@
 // ===== 专项回归：双人 Pong 难度平衡（pong.js v3.12.x 锁定式进攻误差重做） =====
+// verify-suite:timeout=900000
 // 用户反馈：「双人pong还是难度太高」「都难，我赢不了」。
 // 根因：AI 的 predictErr/missRate 原实现是每帧重掷的噪声，挡板连续追踪时互相平均掉，
 //       配置表里的失误率形同虚设——低难档 AI 实际几乎不失误。v3.12.x 改为每次球飞向 TA
@@ -35,7 +36,8 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
 // ---- 测试专用组装：template + 仅 pong.js（前置注入虚拟时钟 shim），不碰仓库构建产物 ----
 const SHIM = `
 window.__VC = { t: 0, q: [], seq: 0 };
-try { __VC.t = performance.now.bind(performance)(); } catch (e) { __VC.t = 0; }
+// 原点必须钉死 0：读加载时的真实 performance.now 会让「固定种子」矩阵逐次跑随页面加载耗时
+// 漂移原点，恰好卡在 >= 判据边缘的帧窗口（hard×strong 长回合）偶发多跑/少跑一帧→超时与否不复现（#784 排查时实测同码三跑 1 红）。
 try { performance.now = function () { return __VC.t; }; } catch (e) {}
 window.requestAnimationFrame = function (cb) { __VC.q.push(cb); return ++__VC.seq; };
 window.cancelAnimationFrame = function () {};
@@ -79,7 +81,7 @@ const server = createServer((req, res) => {
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const baseUrl = 'http://127.0.0.1:' + server.address().port;
-const cdpPort = 9700 + Math.floor(Math.random() * 200);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9700 + Math.floor(Math.random() * 200));
 const chrome = spawn(chromePath, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + join(process.env.TEMP || '/tmp', 'mochi-pongbal-' + Date.now()), '--remote-debugging-port=' + cdpPort, 'about:blank'], { stdio: 'ignore' });
 
 let ws = null, msgId = 0; const pend = new Map();
