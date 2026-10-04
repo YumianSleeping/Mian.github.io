@@ -50,7 +50,7 @@ const server = createServer((req, res) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const baseUrl = 'http://127.0.0.1:' + server.address().port;
 
-const cdpPort = 9970 + Math.floor(Math.random() * 60);
+const cdpPort = Number(process.env.MOCHI_CDP_PORT) || (9970 + Math.floor(Math.random() * 60));
 const chrome = spawn(chromePath, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--user-data-dir=' + join(process.env.TEMP || '/tmp', 'mochi-chat-winsync-' + Date.now()),
@@ -102,6 +102,7 @@ function check(desc, ok, detail) {
 }
 
 const KEY = 'xy-home-v2:default:chat-msgs';
+const TAIL = 'xy-home-v2:default:chat-tail'; // #180 同步尾巴日志（整包换种子时必须一并清零）
 // 种子：n 条纯文本历史（唯一文案「历史#i」，out/in 交替），无图片避免 LS 有损剥离干扰
 function seed(n) {
   const t = Date.now() - n * 60000;
@@ -121,6 +122,10 @@ async function bootWithSeed(n) {
     try {
       localStorage.setItem('${KEY}', ${JSON.stringify(s)});
       await window.idbSet('${KEY}', ${JSON.stringify(s)});
+      // 整包换成种子时，上一次运行留在尾巴日志里的消息必须一并清零：那是产品「未落盘」台账，
+      // 留着它＝权威读库后 chatTailMerge 如实回放上一轮的消息 ⇒ A0 数到的条数天然大于种子数。
+      localStorage.removeItem('${TAIL}');
+      if (window.idbDelete) await window.idbDelete('${TAIL}');
       return true;
     } catch (e) { return false; }
   })()`);
@@ -174,8 +179,14 @@ const WIGGLE = `(function(){
 {
   await bootWithSeed(120); // ≤ RENDER_MAX(200)：进入后 renderStart=0，收消息走增量追加路径
   await openChat();
-  const base = await evalJs(`window.getChatMsgs().length`);
-  check('A0 历史加载完整', base === 120, 'msgs=' + base);
+  // 产品开屏会往聊天里注入「当日提醒」（拍一拍 + 日常状态各一条，一天一次），整包条数天然大于种子数；
+  // A0 要证的是「历史一条不少、一条不多」，因此按种子文案逐条数，而不是比总长。
+  const base = JSON.parse(await evalJs(`(function(){
+    var a=window.getChatMsgs(), seen={}, dup=0, hit=0;
+    a.forEach(function(m){ var t=String((m&&m.text)||''); if(t.indexOf('历史#')!==0) return; if(seen[t])dup++; else{seen[t]=1;hit++;} });
+    return JSON.stringify({total:a.length, hit:hit, dup:dup, kinds:Object.keys(seen).length});
+  })()`) || '{}');
+  check('A0 历史加载完整（种子 120 条各在位一次，无丢失无重复）', base.hit === 120 && base.kinds === 120 && base.dup === 0, JSON.stringify(base));
 
   // A1 TA 文本消息：注入（自动贴底滚动即产生 scroll 事件）+ 显式轻扫
   await evalJs(`window.chatAddIn('TA测试消息甲')`);
@@ -194,12 +205,14 @@ const WIGGLE = `(function(){
   check('A2 系统提示消息只显示 1 条', a2 === 1, 'count=' + a2);
 
   // A3 互动卡片（ask-msg 引导条 + ask-card 卡片，ta-ask 同款注入方式）不双条
-  await evalJs(`window.chatAddSystem('TA想问你一个问题。',{special:'ask-msg'})`);
+  // 引导条文本必须自带夹具标记：产品文案「TA想问你一个问题。」由 ta-ask.js 随机询问注入，
+  // 撞进同一测试窗口就多出一条同文本的 ask-msg＝按文本计数的判据不成立（实测 tip=2 偶发红）。
+  await evalJs(`window.chatAddSystem('A3夹具引导条·勿改此文本',{special:'ask-msg'})`);
   await evalJs(`window.chatAddSystem('今晚吃什么好呢?',{special:'ask-card',askQuestion:'今晚吃什么好呢?',askOptions:null,askType:'text'})`);
   await sleep(500);
   await evalJs(WIGGLE);
   await sleep(500);
-  const a3a = await evalJs(countTextJs('TA想问你一个问题。'));
+  const a3a = await evalJs(countTextJs('A3夹具引导条·勿改此文本'));
   const a3b = await evalJs(countTextJs('今晚吃什么好呢?'));
   check('A3 互动卡片只显示 1 张（引导条+卡片）', a3a === 1 && a3b === 1, 'tip=' + a3a + ' card=' + a3b);
 
@@ -238,7 +251,7 @@ const WIGGLE = `(function(){
   // 置顶状态注入 2 条 TA 消息（远离底部 → 走增量 append 成"脱尾"）
   await evalJs(`window.chatAddIn('深翻测试消息一')`);
   await sleep(250);
-  await evalJs(`window.chatAddSystem('TA想问你一个问题。',{special:'ask-msg'})`);
+  await evalJs(`window.chatAddSystem('B1夹具提问·勿改此文本',{special:'ask-msg'})`);
   await sleep(250);
   // 跳回底部 + 派发 scroll → 触发 loadNewerIncremental 补画缺口
   await evalJs(`(function(){var b=document.getElementById('chat-body');b.scrollTop=b.scrollHeight;b.dispatchEvent(new Event('scroll'));return 1;})()`);
@@ -246,7 +259,7 @@ const WIGGLE = `(function(){
   await evalJs(WIGGLE);
   await sleep(500);
   const b1 = await evalJs(countTextJs('深翻测试消息一'));
-  const b2 = await evalJs(countTextJs('TA想问你一个问题。'));
+  const b2 = await evalJs(countTextJs('B1夹具提问·勿改此文本'));
   check('B1 裁尾补画后脱尾消息不重画', b1 === 1 && b2 === 1, 'm=' + b1 + ' card=' + b2);
 
   const invB = JSON.parse(await evalJs(INVARIANT));
